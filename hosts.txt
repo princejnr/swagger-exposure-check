@@ -1,0 +1,6 @@
+# Add one hostname (or host:port) per line.
+# Lines starting with # are ignored.
+
+# Public examples (replace with your authorised internal targets):
+petstore.swagger.io
+httpbin.org
