@@ -54,6 +54,11 @@ DEFAULT_PATHS: list[str] = [
     "/v3/api-docs",
     "/openapi.json",
     "/openapi.yaml",
+    "/swagger.json",
+    "/swagger.yaml",
+    "/v1/swagger.json",
+    "/v2/swagger.json",
+    "/v3/swagger.json",
     "/docs",
     "/redoc",
 ]
