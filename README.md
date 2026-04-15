@@ -39,37 +39,43 @@
 | `/v3/api-docs` | OpenAPI 3.0 raw JSON |
 | `/openapi.json` | OpenAPI 3.0 canonical path |
 | `/openapi.yaml` | OpenAPI 3.0 YAML |
+| `/swagger.json` | Swagger 2.0/3.0 JSON |
 | `/docs` | FastAPI / Starlette |
 | `/redoc` | ReDoc UI |
 
 For each endpoint it:
 1. **Fetches** the URL (with retry & configurable timeout)
 2. **Reads up to 4 KB** of the response body to detect real Swagger/OpenAPI content, regardless of `Content-Type`
-3. **Classifies** the result by severity (`high` / `medium` / `info` / `ok` / `error`)
-4. **Prints** a live, colour-coded progress table to the terminal
-5. **Writes** a timestamped `.csv` and `.json` report
+3. **Audits Security Headers:** Checks for missing `X-Frame-Options`, `Content-Security-Policy`, `X-Content-Type-Options`, and `HSTS`.
+4. **Detects WAFs:** Identifies common Web Application Firewalls (Cloudflare, Akamai, etc.) via response headers.
+5. **Classifies** the result by severity (`critical` / `high` / `medium` / `info` / `ok` / `error`)
+6. **Prints** a live, colour-coded progress table to the terminal
+7. **Writes** a timestamped `.csv` and `.json` report
 
 ### Live output example
 
 ```
-  swagger-exposure-check v3.0
-  Hosts: 12  |  Paths: 10  |  Total checks: 120  |  Workers: 20
+  swagger-exposure-check v3.1
+  Hosts: 12  |  Paths: 15  |  Total checks: 180  |  Workers: 3
 
-  [ 1/120] 🟢 404      OK  https://api.example.com/swagger
-  [ 2/120] 🔴 200    HIGH  https://dev.example.com/v2/api-docs
-  [ 3/120] 🟡 302  MEDIUM  https://staging.example.com/docs
+  [ 1/180] 🟢 404        OK  https://api.example.com/swagger
+  [ 2/180] 💥 200  CRITICAL  https://dev.example.com/v2/swagger.json
+  [ 3/180] 🔴 200      HIGH  https://staging.example.com/docs
+  [ 4/180] 🟡 302    MEDIUM  https://example.com/api-docs
   ...
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   SUMMARY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      HIGH  ██  2
-    MEDIUM  █  1
-        OK  ████████████████  116
+    CRITICAL  █  1
+        HIGH  █  1
+      MEDIUM  █  1
+          OK  ████████████████  177
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  ⚠  HIGH severity endpoints:
-       https://dev.example.com/v2/api-docs  [API documentation confirmed in body]
+  ⚠  CRITICAL / HIGH severity endpoints:
+       https://dev.example.com/v2/swagger.json [WAF: cloudflare] [Missing: X-Frame-Options, CSP]
+       Note: unprotected API docs confirmed in body (missing 2 security headers)
 ```
 
 ---
@@ -241,9 +247,11 @@ Two timestamped files are written after every run.
 | `content_type` | `Content-Type` header value |
 | `final_url` | URL after redirects |
 | `body_confirmed` | `True` if response body contained API-doc tokens |
-| `severity` | `high` / `medium` / `info` / `ok` / `error` |
+| `severity` | `critical` / `high` / `medium` / `info` / `ok` / `error` |
 | `note` | Human-readable reason |
 | `error` | Network/connection error message if any |
+| `missing_headers` | List of missing security headers |
+| `waf_detected` | Detected WAF signature if any |
 
 ### JSON (`swagger_exposure_report_YYYYMMDDTHHMMSSZ.json`)
 
@@ -251,12 +259,13 @@ Two timestamped files are written after every run.
 {
   "generated_at_utc": "2026-04-14T21:32:00+00:00",
   "total_hosts_probed": 12,
-  "total_findings": 120,
+  "total_findings": 180,
   "counts_by_severity": {
-    "high": 2,
+    "critical": 1,
+    "high": 1,
     "medium": 1,
     "info": 3,
-    "ok": 113,
+    "ok": 173,
     "error": 1
   },
   "findings": [ ... ]
@@ -269,10 +278,11 @@ Two timestamped files are written after every run.
 
 | Severity | Condition |
 |---|---|
-| 🔴 **high** | HTTP 200 + API-doc content confirmed in body **or** matching `Content-Type` |
+| 💥 **critical** | HTTP 200 + API-doc tokens confirmed in response body |
+| 🔴 **high** | HTTP 200 + API JSON/YAML content type (unconfirmed body) |
 | 🟡 **medium** | HTTP 2xx/3xx with redirect toward a documentation path |
 | 🔵 **info** | Endpoint exists but is protected (401/403) or an unexpected redirect |
-| 🟢 **ok** | HTTP 404 — endpoint not present |
+| 🟢 **ok** | HTTP 404 — endpoint not present, **or** reachable but no documentation content detected |
 | ⚫ **error** | Network error, DNS failure, timeout |
 
 ---

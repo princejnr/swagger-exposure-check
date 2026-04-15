@@ -373,8 +373,15 @@ def classify(
         note_suffix = f" (missing {missing_count} security headers)" if missing_count > 0 else ""
         if body_confirmed:
             return "critical", f"unprotected API docs confirmed in body{note_suffix}"
-        if any(t in lowered_type for t in ("json", "yaml", "html", "text/plain")):
-            return "high", f"endpoint reachable{note_suffix}"
+        
+        # If not confirmed in body, be more skeptical of common web types (often custom 404s)
+        if any(t in lowered_type for t in ("json", "yaml")):
+            return "high", f"endpoint reachable (likely API data){note_suffix}"
+        
+        if any(t in lowered_type for t in ("html", "text/plain")):
+            # If it's just HTML/Text and NOT confirmed, it's likely a generic landing or 404 page
+            return "ok", "reachable but no API documentation detected"
+            
         return "medium", f"reachable with uncommon content type{note_suffix}"
 
     if status in (301, 302, 307, 308):
