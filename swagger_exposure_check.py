@@ -90,6 +90,19 @@ BODY_CONFIRMATION_TOKENS: tuple[str, ...] = (
     "swagger:", "swagger-ui", "SwaggerUIBundle", "redoc", "ReDoc",
 )
 
+# New security check constants
+SECURITY_HEADERS: dict[str, str] = {
+    "X-Frame-Options": "Prevents Clickjacking (e.g. DENY, SAMEORIGIN)",
+    "Content-Security-Policy": "Mitigates XSS and data injection (e.g. default-src 'self')",
+    "X-Content-Type-Options": "Prevents MIME-sniffing (e.g. nosniff)",
+    "Strict-Transport-Security": "Forces HTTPS (HSTS)",
+}
+
+WAF_INDICATORS: tuple[str, ...] = (
+    "cloudflare", "cf-ray", "incapsula", "sucuri", "akami", "imperva",
+    "f5", "barracuda", "wordfence", "mod_security", "fortinet",
+)
+
 MAX_BODY_READ = 4096
 DEFAULT_WORKERS = 3        # Conservative default — raise with --workers for authorised bulk audits
 DEFAULT_DNS_WORKERS = 20
@@ -102,14 +115,15 @@ RETRY_BACKOFF = 0.5
 
 _USE_COLOUR = sys.stdout.isatty()
 _COLOURS = {
-    "high":   "\033[91m",
-    "medium": "\033[93m",
-    "info":   "\033[96m",
-    "ok":     "\033[92m",
-    "error":  "\033[90m",
-    "reset":  "\033[0m",
-    "bold":   "\033[1m",
-    "dim":    "\033[2m",
+    "critical": "\033[1;31m",
+    "high":     "\033[91m",
+    "medium":   "\033[93m",
+    "info":     "\033[96m",
+    "ok":       "\033[92m",
+    "error":    "\033[90m",
+    "reset":    "\033[0m",
+    "bold":     "\033[1m",
+    "dim":      "\033[2m",
 }
 
 
@@ -135,6 +149,8 @@ class Finding:
     severity: str
     note: str
     error: str
+    missing_headers: list[str] = field(default_factory=list)
+    waf_detected: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -341,28 +357,45 @@ def classify(
     path: str,
     err: str,
     body_confirmed: bool = False,
+    missing_headers: list[str] = None,
+    waf_detected: str = "",
 ) -> tuple[str, str]:
     lowered_type = content_type.lower()
     lowered_url = final_url.lower()
+    missing_count = len(missing_headers) if missing_headers else 0
+
     if err:
+        if waf_detected:
+            return "info", f"blocked by {waf_detected}"
         return "error", err
+
     if status == 200:
+        note_suffix = f" (missing {missing_count} security headers)" if missing_count > 0 else ""
         if body_confirmed:
-            return "high", "API documentation confirmed in body"
+            return "critical", f"unprotected API docs confirmed in body{note_suffix}"
         if any(t in lowered_type for t in ("json", "yaml", "html", "text/plain")):
-            return "high", "endpoint reachable"
-        return "medium", "reachable with uncommon content type"
+            return "high", f"endpoint reachable{note_suffix}"
+        return "medium", f"reachable with uncommon content type{note_suffix}"
+
     if status in (301, 302, 307, 308):
         doc_tokens = ("swagger", "api-docs", "openapi", "redoc", "docs")
         if any(t in lowered_url for t in doc_tokens):
             return "medium", "redirects toward documentation endpoint"
         return "info", "redirected"
+
     if status in (401, 403):
-        return "info", "endpoint present but protected"
+        if waf_detected:
+            return "info", f"protected/blocked by {waf_detected}"
+        return "ok", "endpoint present but protected"
+
     if status == 404:
         return "ok", "not found"
+
     if status:
+        if waf_detected:
+            return "info", f"http {status} (via {waf_detected})"
         return "info", f"http {status}"
+
     return "error", f"no response for {path}"
 
 
@@ -384,17 +417,45 @@ def fetch(
             req = request.Request(url, method="GET")
             with opener.open(req, timeout=timeout) as resp:
                 status: int | None = getattr(resp, "status", None)
-                ct: str = resp.headers.get("Content-Type", "")
+                headers = resp.headers
+                ct: str = headers.get("Content-Type", "")
                 final_url: str = resp.geturl()
+                
+                # Check for WAF
+                waf = ""
+                header_text = str(headers).lower()
+                for indicator in WAF_INDICATORS:
+                    if indicator in header_text:
+                        waf = indicator
+                        break
+                
+                # Check for security headers
+                missing = []
+                for sh in SECURITY_HEADERS:
+                    if sh not in headers:
+                        missing.append(sh)
+                
                 body = resp.read(MAX_BODY_READ)
                 confirmed = _body_confirmed(body)
-                sev, note = classify(status, ct, final_url, path, "", confirmed)
-                return Finding(host, path, url, status, ct, final_url, confirmed, sev, note, "")
+                sev, note = classify(status, ct, final_url, path, "", confirmed, missing, waf)
+                return Finding(host, path, url, status, ct, final_url, confirmed, sev, note, "", missing, waf)
+        
         except error.HTTPError as exc:
-            ct = exc.headers.get("Content-Type", "")
+            headers = exc.headers
+            ct = headers.get("Content-Type", "")
             fu = exc.geturl() or url
-            sev, note = classify(exc.code, ct, fu, path, "")
-            return Finding(host, path, url, exc.code, ct, fu, False, sev, note, "")
+            
+            # WAF detection on error
+            waf = ""
+            header_text = str(headers).lower()
+            for indicator in WAF_INDICATORS:
+                if indicator in header_text:
+                    waf = indicator
+                    break
+            
+            sev, note = classify(exc.code, ct, fu, path, "", False, [], waf)
+            return Finding(host, path, url, exc.code, ct, fu, False, sev, note, "", [], waf)
+            
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             if attempt < retries:
@@ -403,7 +464,7 @@ def fetch(
     msg = str(last_exc).strip() if last_exc else "unknown error"
     msg = msg or (last_exc.__class__.__name__ if last_exc else "unknown error")
     sev, note = classify(None, "", url, path, msg)
-    return Finding(host, path, url, None, "", url, False, sev, note, msg)
+    return Finding(host, path, url, None, "", url, False, sev, note, msg, [], "")
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +510,14 @@ def iter_findings(
 # Console output
 # ---------------------------------------------------------------------------
 
-_SEV_ICON = {"high": "🔴", "medium": "🟡", "info": "🔵", "ok": "🟢", "error": "⚫"}
+_SEV_ICON = {
+    "critical": "💥",
+    "high": "🔴",
+    "medium": "🟡",
+    "info": "🔵",
+    "ok": "🟢",
+    "error": "⚫",
+}
 
 
 def _print_progress(finding: Finding, done: int, total: int) -> None:
@@ -457,33 +525,37 @@ def _print_progress(finding: Finding, done: int, total: int) -> None:
     icon = _SEV_ICON.get(sev, "  ")
     status_str = str(finding.status) if finding.status else "ERR"
     width = len(str(total))
-    sev_lbl = colour(sev.upper().rjust(6), sev)
+    sev_lbl = colour(sev.upper().rjust(8), sev)
     print(f"  [{done:>{width}}/{total}] {icon} {status_str:>3}  {sev_lbl}  {finding.url}")
 
 
 def print_summary(findings: list[Finding]) -> None:
-    counts = {lv: sum(1 for f in findings if f.severity == lv)
-              for lv in ("high", "medium", "info", "ok", "error")}
+    lvls = ("critical", "high", "medium", "info", "ok", "error")
+    counts = {lv: sum(1 for f in findings if f.severity == lv) for lv in lvls}
 
     print()
     print(colour("━" * 64, "bold"))
     print(colour("  SUMMARY", "bold"))
     print(colour("━" * 64, "bold"))
 
-    for level, count in counts.items():
+    for level in lvls:
+        count = counts[level]
         if count == 0:
             continue
         bar = "█" * min(count, 40)
         lbl = colour(level.upper().rjust(8), level)
         print(f"  {lbl}  {bar}  {count}")
 
-    high_findings = [f for f in findings if f.severity == "high"]
-    if high_findings:
+    # Show Critical/High findings in detail
+    warn_findings = [f for f in findings if f.severity in ("critical", "high")]
+    if warn_findings:
         print()
-        print(colour("  ⚠  HIGH severity endpoints:", "high"))
-        for f in high_findings:
-            confirmed_tag = " (body-confirmed)" if f.body_confirmed else ""
-            print(f"       {f.url}  [{f.note}{confirmed_tag}]")
+        print(colour("  ⚠  CRITICAL / HIGH severity endpoints:", "critical"))
+        for f in warn_findings:
+            waf_tag = f" [WAF: {f.waf_detected}]" if f.waf_detected else ""
+            headers_tag = f" [Missing: {', '.join(f.missing_headers)}]" if f.missing_headers else ""
+            print(f"       {f.url}{waf_tag}{headers_tag}")
+            print(f"       Note: {f.note}")
 
     print(colour("━" * 64, "bold"))
     print()
@@ -502,12 +574,15 @@ def write_reports(findings: list[Finding], output_dir: Path, output_urls_file: s
     fieldnames = [
         "host", "path", "url", "status", "content_type",
         "final_url", "body_confirmed", "severity", "note", "error",
+        "missing_headers", "waf_detected"
     ]
     with csv_path.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
         for f in findings:
-            writer.writerow(asdict(f))
+            row = asdict(f)
+            row["missing_headers"] = ", ".join(row["missing_headers"])
+            writer.writerow(row)
 
     summary = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -515,16 +590,16 @@ def write_reports(findings: list[Finding], output_dir: Path, output_urls_file: s
         "total_findings": len(findings),
         "counts_by_severity": {
             lv: sum(1 for f in findings if f.severity == lv)
-            for lv in ("high", "medium", "info", "ok", "error")
+            for lv in ("critical", "high", "medium", "info", "ok", "error")
         },
         "findings": [asdict(f) for f in findings],
     }
     json_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    
+
     if output_urls_file:
         urls_path = Path(output_urls_file)
         urls_path.parent.mkdir(parents=True, exist_ok=True)
-        exposed_urls = [f.url for f in findings if f.severity in ("high", "medium")]
+        exposed_urls = [f.url for f in findings if f.severity in ("critical", "high", "medium")]
         urls_path.write_text("\n".join(exposed_urls) + "\n", encoding="utf-8")
 
     return csv_path, json_path
