@@ -103,6 +103,10 @@ WAF_INDICATORS: tuple[str, ...] = (
     "f5", "barracuda", "wordfence", "mod_security", "fortinet",
 )
 
+WAYBACK_TOKENS: tuple[str, ...] = (
+    "swagger", "openapi", "api-docs", "redoc", "docs", ".json", ".yaml", ".yml",
+)
+
 MAX_BODY_READ = 4096
 DEFAULT_WORKERS = 3        # Conservative default — raise with --workers for authorised bulk audits
 DEFAULT_DNS_WORKERS = 20
@@ -197,6 +201,8 @@ def parse_args() -> argparse.Namespace:
                         help="Directory to write reports into. Default: current directory.")
     parser.add_argument("--output-urls",
                         help="Optional: extract just the URLs of HIGH/MEDIUM findings to a text file.")
+    parser.add_argument("--use-wayback", action="store_true",
+                        help="Query Wayback Machine (CDX) for historical URLs (discovery).")
     parser.add_argument("--yes", action="store_true",
                         help="Skip the interactive authorisation confirmation prompt (for CI/scripts).")
     return parser.parse_args()
@@ -311,6 +317,57 @@ def expand_hosts(
             seen.add(h)
             unique.append(h)
     return unique
+
+
+def fetch_wayback_urls(host: str, timeout: float) -> set[str]:
+    """
+    Query Wayback Machine CDX for historical URLs of a given host.
+    Filters results for potential Swagger/OpenAPI endpoints.
+    """
+    print(colour(f"     ⟳  Querying Wayback Machine for {host} ...", "dim"))
+    found_paths: set[str] = set()
+    cdx_url = f"https://web.archive.org/cdx/search/cdx?url={host}/*&output=json&fl=original&collapse=urlkey"
+    
+    try:
+        req = request.Request(cdx_url, method="GET")
+        req.add_header("User-Agent", "swagger-exposure-check/3.1")
+        with request.urlopen(req, timeout=timeout) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode('utf-8'))
+                if not data or len(data) < 2:
+                    return found_paths
+                
+                # First row is header: ["original"]
+                for row in data[1:]:
+                    original_url = row[0]
+                    try:
+                        # Extract path from URL
+                        # Split by host and take the last part
+                        if host in original_url:
+                            path = original_url.split(host, 1)[-1]
+                            if not path.startswith("/"):
+                                path = f"/{path}"
+                            
+                            # Filter for interesting tokens
+                            if any(t in path.lower() for t in WAYBACK_TOKENS):
+                                # Remove query params for cleaner path probing
+                                clean_path = path.split("?")[0].split("#")[0]
+                                
+                                # Noise reduction: skip paths with likely garbage/encoding artifacts
+                                garbage_indicators = ("%", "\\", "\"", "'", "<", ">", "http", ":", " ", " h ", " -", ",")
+                                if any(g in clean_path.lower() for g in garbage_indicators):
+                                    continue
+                                    
+                                if clean_path and clean_path != "/":
+                                    found_paths.add(clean_path)
+                    except Exception:
+                        continue
+        if found_paths:
+            print(colour(f"        ✓ Discovered {len(found_paths)} unique historical paths", "dim"))
+    except Exception as exc:
+        print(colour(f"        ⚠ Wayback fetch failed for {host} ({exc})", "error"))
+        
+    return found_paths
 
 
 # ---------------------------------------------------------------------------
@@ -486,10 +543,14 @@ def iter_findings(
     timeout: float,
     retries: int,
     workers: int,
+    custom_host_paths: dict[str, set[str]] = None,
 ) -> list[Finding]:
     tasks = []
+    custom_host_paths = custom_host_paths or {}
     for host in hosts:
-        for path in paths:
+        # Combine default paths with host-specific discovered paths
+        host_paths = set(paths) | custom_host_paths.get(host, set())
+        for path in host_paths:
             normalized = path if path.startswith("/") else f"/{path}"
             url = f"{scheme}://{host}{normalized}"
             tasks.append((url, host, normalized))
@@ -690,18 +751,36 @@ def main() -> int:
     scheme = "http" if args.http else "https"
     opener = build_opener(args.insecure, args.header)
 
-    total_checks = len(hosts) * len(paths)
+    custom_host_paths = {}
+    total_discovered = 0
+    if args.use_wayback:
+        print(colour("\n  ⟳  Phase 1: Historical Discovery (Wayback Machine)", "bold"))
+        # Use a longer timeout for OSINT discovery as CDX can be slow
+        osint_timeout = max(30.0, args.timeout)
+        for host in hosts:
+            discovered = fetch_wayback_urls(host, osint_timeout)
+            if discovered:
+                custom_host_paths[host] = discovered
+                total_discovered += len(discovered)
+        print(colour(f"     Discovery complete: {total_discovered} historical paths found.\n", "dim"))
+
+    total_checks = (len(hosts) * len(paths)) + total_discovered
     print(colour("\n  swagger-exposure-check v3.1", "bold"))
     print(
         f"  Hosts: {len(hosts)}  |  Paths: {len(paths)}  |  "
         f"Total checks: {total_checks}  |  Workers: {args.workers}"
     )
+    if total_discovered > 0:
+        print(colour(f"  + {total_discovered} discovered historical paths will be probed.", "dim"))
+    
     if wildcards and args.enumerate_subdomains:
         dns_label = "with DNS filter" if dns_check else "no DNS filter"
         print(colour(f"  Wildcards: {', '.join(wildcards)}  ({dns_label})", "dim"))
     print()
 
-    findings = iter_findings(hosts, paths, scheme, opener, args.timeout, args.retries, args.workers)
+    findings = iter_findings(
+        hosts, paths, scheme, opener, args.timeout, args.retries, args.workers, custom_host_paths
+    )
     print_summary(findings)
 
     csv_path, json_path = write_reports(findings, output_dir, args.output_urls)

@@ -44,13 +44,14 @@
 | `/redoc` | ReDoc UI |
 
 For each endpoint it:
-1. **Fetches** the URL (with retry & configurable timeout)
-2. **Reads up to 4 KB** of the response body to detect real Swagger/OpenAPI content, regardless of `Content-Type`
-3. **Audits Security Headers:** Checks for missing `X-Frame-Options`, `Content-Security-Policy`, `X-Content-Type-Options`, and `HSTS`.
-4. **Detects WAFs:** Identifies common Web Application Firewalls (Cloudflare, Akamai, etc.) via response headers.
-5. **Classifies** the result by severity (`critical` / `high` / `medium` / `info` / `ok` / `error`)
-6. **Prints** a live, colour-coded progress table to the terminal
-7. **Writes** a timestamped `.csv` and `.json` report
+1. **Discovers Historical Paths:** (Optional) Queries the Wayback Machine (CDX) to find deeply nested or legacy documentation paths unique to each host.
+2. **Fetches** the URL (with retry & configurable timeout)
+3. **Reads up to 4 KB** of the response body to detect real Swagger/OpenAPI content, regardless of `Content-Type`
+4. **Audits Security Headers:** Checks for missing `X-Frame-Options`, `Content-Security-Policy`, `X-Content-Type-Options`, and `HSTS`.
+5. **Detects WAFs:** Identifies common Web Application Firewalls (Cloudflare, Akamai, etc.) via response headers.
+6. **Classifies** the result by severity (`critical` / `high` / `medium` / `info` / `ok` / `error`)
+7. **Prints** a live, colour-coded progress table to the terminal
+8. **Writes** a timestamped `.csv` and `.json` report
 
 ### Live output example
 
@@ -128,38 +129,24 @@ When an entry starts with `*.` (e.g. `*.example.com`), the tool performs a two-s
 
 Only living, resolving subdomains are added to the scan queue.
 
+### Historical Discovery (Wayback Machine)
+
+Use `--use-wayback` to query the **Wayback Machine (CDX API)** for historical URLs associated with your targets. The tool filters thousands of archived URLs for keywords like `swagger`, `openapi`, and `.json` to discover deeply nested or legacy documentation paths that no longer appear on the main site but may still be active.
+
 ```bash
-# Scan *.corp-domain.internal — enumerate subdomains via OSINT & wordlist
+# Combine subdomain enumeration with historical path discovery
 python3 swagger_exposure_check.py hosts.txt \
   --enumerate-subdomains \
-  --output-dir ./reports
-
-# Export the raw URLs of exposed endpoints (e.g. for nuclei / httpx)
-python3 swagger_exposure_check.py hosts.txt \
-  --enumerate-subdomains \
-  --output-urls ./exposed_apis.txt
-```
-
-**Custom subdomain wordlist** (`my-subs.txt`):
-```
-# one per line
-api
-backend
-portal
-payments
-auth
-v1
-v2
+  --use-wayback
 ```
 
 ---
 
 ## 🗺️ Roadmap & Future Features
 
-While this tool currently checks the top 10 most standard Swagger paths at the root of a domain, developers sometimes hide API docs in deeply nested random directories (e.g., `/core/v4/internal/hidden/swagger.json`). 
+While this tool currently checks the most standard Swagger paths, developers sometimes hide API docs in deeply nested random directories. 
 
 Future versions of this tool aim to implement:
-- **Wayback Machine CDX Integration:** An OSINT feature to query `web.archive.org` and AlienVault OTX to discover historically logged, deeply-nested `/swagger` paths that would be impossible to brute-force.
 - **Automated JavaScript Scraping:** A spidering engine to fetch `.js` Webpack bundles from target applications and extract hidden hardcoded API routes.
 - **Deep Fuzzing Support:** Expanded built-in wordlists containing hundreds of known nested Swagger directory structures pulled from SecLists.
 
@@ -208,6 +195,7 @@ usage: swagger_exposure_check.py [-h] [--timeout TIMEOUT] [--http]
 | `--retries` | `2` | Retries on transient network errors |
 | `--output-dir` | `.` | Directory for CSV/JSON reports |
 | `--output-urls` | | Optional file to write raw exposed URLs (HIGH/MEDIUM severity) line-by-line |
+| `--use-wayback` | **`false`** | Query Wayback Machine (CDX) for historical URL discovery |
 | `--yes` | `false` | Skip interactive consent prompt (for CI/scripted use) |
 
 ### Common recipes
