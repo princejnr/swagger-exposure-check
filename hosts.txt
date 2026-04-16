@@ -2,5 +2,5 @@
 # Lines starting with # are ignored.
 
 # Public examples (replace with your authorised internal targets):
-petstore.swagger.io
+example.url.io
 httpbin.org
