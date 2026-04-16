@@ -44,19 +44,20 @@
 | `/redoc` | ReDoc UI |
 
 For each endpoint it:
-1. **Discovers Historical Paths:** (Optional) Queries the Wayback Machine (CDX) to find deeply nested or legacy documentation paths unique to each host.
-2. **Fetches** the URL (with retry & configurable timeout)
-3. **Reads up to 4 KB** of the response body to detect real Swagger/OpenAPI content, regardless of `Content-Type`
-4. **Audits Security Headers:** Checks for missing `X-Frame-Options`, `Content-Security-Policy`, `X-Content-Type-Options`, and `HSTS`.
-5. **Detects WAFs:** Identifies common Web Application Firewalls (Cloudflare, Akamai, etc.) via response headers.
-6. **Classifies** the result by severity (`critical` / `high` / `medium` / `info` / `ok` / `error`)
-7. **Prints** a live, colour-coded progress table to the terminal
-8. **Writes** a timestamped `.csv` and `.json` report
+1. **Discovers Historical Paths:** (Optional) Queries the Wayback Machine (CDX) to find deeply nested or legacy documentation paths.
+2. **Scrapes JavaScript Bundles:** (Optional) Fetches the application root, identifies `.js` bundles, and scrapes them for hidden API routes.
+3. **Fetches** the URL (with retry & configurable timeout).
+4. **Reads up to 4 KB** of the response body to detect real Swagger/OpenAPI content.
+5. **Audits Security Headers:** Checks for missing `X-Frame-Options`, `CSP`, `X-Content-Type-Options`, and `HSTS`.
+6. **Detects WAFs:** Identifies common Web Application Firewalls (Cloudflare, Akamai, etc.).
+7. **Classifies** the result by severity (`critical` / `high` / `medium` / `info` / `ok` / `error`).
+8. **Prints** a live, colour-coded progress table to the terminal.
+9. **Writes** a timestamped `.csv` and `.json` report.
 
 ### Live output example
 
 ```
-  swagger-exposure-check v3.1
+  swagger-exposure-check v3.2
   Hosts: 12  |  Paths: 15  |  Total checks: 180  |  Workers: 3
 
   [ 1/180] 🟢 404        OK  https://api.example.com/swagger
@@ -127,17 +128,24 @@ When an entry starts with `*.` (e.g. `*.example.com`), the tool performs a two-s
 2. **Wordlist Expansion:** Combines the OSINT results with a built-in wordlist of **60 common names** (`api`, `dev`, `staging`, `admin`, `gateway`, etc.).
 3. **DNS Validation:** Resolves every candidate via DNS concurrently (default 20 threads) to filter out dead subdomains.
 
-Only living, resolving subdomains are added to the scan queue.
-
 ### Historical Discovery (Wayback Machine)
 
 Use `--use-wayback` to query the **Wayback Machine (CDX API)** for historical URLs associated with your targets. The tool filters thousands of archived URLs for keywords like `swagger`, `openapi`, and `.json` to discover deeply nested or legacy documentation paths that no longer appear on the main site but may still be active.
 
+### JavaScript Scraping
+
+Use `--use-js` to enable the automated JavaScript scraping engine. The tool will:
+1. Fetch the root page of each target host.
+2. Identify all `<script src="...">` bundles (Webpack, Vite, etc.).
+3. Fetch and scan those JS files for hardcoded API endpoints using high-precision regex.
+4. Add any discovered paths to the probe queue for that host.
+
 ```bash
-# Combine subdomain enumeration with historical path discovery
+# Combine all discovery methods for maximum coverage
 python3 swagger_exposure_check.py hosts.txt \
   --enumerate-subdomains \
-  --use-wayback
+  --use-wayback \
+  --use-js
 ```
 
 ---
@@ -147,7 +155,6 @@ python3 swagger_exposure_check.py hosts.txt \
 While this tool currently checks the most standard Swagger paths, developers sometimes hide API docs in deeply nested random directories. 
 
 Future versions of this tool aim to implement:
-- **Automated JavaScript Scraping:** A spidering engine to fetch `.js` Webpack bundles from target applications and extract hidden hardcoded API routes.
 - **Deep Fuzzing Support:** Expanded built-in wordlists containing hundreds of known nested Swagger directory structures pulled from SecLists.
 
 ---
@@ -175,7 +182,8 @@ usage: swagger_exposure_check.py [-h] [--timeout TIMEOUT] [--http]
                                   [--no-dns-check] [--workers WORKERS]
                                   [--dns-workers DNS_WORKERS]
                                   [--retries RETRIES] [--output-dir OUTPUT_DIR]
-                                  [--output-urls OUTPUT_URLS] [--yes]
+                                  [--output-urls OUTPUT_URLS]
+                                  [--use-wayback] [--use-js] [--version] [--yes]
                                   [hosts_file]
 ```
 
@@ -185,17 +193,19 @@ usage: swagger_exposure_check.py [-h] [--timeout TIMEOUT] [--http]
 | `--timeout` | `10` | HTTP request timeout (seconds) |
 | `--http` | `false` | Use `http://` instead of `https://` |
 | `--insecure` | `false` | Skip TLS certificate verification |
-| `--paths-file` | _(built-in 10 paths)_ | Custom paths to probe |
+| `--paths-file` | _(built-in paths)_ | Custom paths to probe |
 | `-H`, `--header` | | Custom HTTP header (`Key: Value`). Can be used multiple times |
-| `--enumerate-subdomains` | **`false` (off)** | Must be set explicitly to enable `crt.sh` + wordlist enumeration on `*.` entries |
-| `--subdomains-file` | _(built-in 60 words)_ | Custom subdomain wordlist for `*.` expansion |
+| `--enumerate-subdomains` | **`false` (off)** | Enable `crt.sh` + wordlist enumeration on `*.` entries |
+| `--subdomains-file` | _(built-in list)_ | Custom subdomain wordlist for `*.` expansion |
 | `--no-dns-check` | `false` | Probe all subdomain candidates without DNS filtering |
-| `--workers` | **`3` (conservative)** | HTTP concurrency — raise deliberately for bulk audits |
+| `--workers` | **`3`** | HTTP concurrency — raise deliberately for bulk audits |
 | `--dns-workers` | `20` | DNS resolution concurrency |
 | `--retries` | `2` | Retries on transient network errors |
 | `--output-dir` | `.` | Directory for CSV/JSON reports |
-| `--output-urls` | | Optional file to write raw exposed URLs (HIGH/MEDIUM severity) line-by-line |
+| `--output-urls` | | Optional file to write raw exposed URLs (HIGH/MEDIUM severity) |
 | `--use-wayback` | **`false`** | Query Wayback Machine (CDX) for historical URL discovery |
+| `--use-js` | **`false`** | Scrape .js bundles for hidden API paths |
+| `--version` | | Show program's version number and exit |
 | `--yes` | `false` | Skip interactive consent prompt (for CI/scripted use) |
 
 ### Common recipes
@@ -207,15 +217,9 @@ python3 swagger_exposure_check.py hosts.txt \
   --paths-file internal-paths.txt \
   --workers 50 --output-dir ./reports
 
-# Wildcard scan with custom subdomain list, no DNS filter:
+# Deep discovery scan (subdomains + historical + JS scraping):
 python3 swagger_exposure_check.py hosts.txt \
-  --subdomains-file wordlist.txt \
-  --no-dns-check \
-  --output-dir ./reports
-
-# Slow/unstable network — extend timeout and retries:
-python3 swagger_exposure_check.py hosts.txt \
-  --timeout 30 --retries 5 --workers 5
+  --enumerate-subdomains --use-wayback --use-js
 ```
 
 ---
@@ -228,6 +232,7 @@ Two timestamped files are written after every run.
 
 | Column | Description |
 |---|---|
+| `tool_version` | Version of the tool used |
 | `host` | Target hostname (as probed) |
 | `path` | URL path checked |
 | `url` | Full URL |
@@ -246,6 +251,7 @@ Two timestamped files are written after every run.
 ```json
 {
   "generated_at_utc": "2026-04-14T21:32:00+00:00",
+  "tool_version": "3.2.0",
   "total_hosts_probed": 12,
   "total_findings": 180,
   "counts_by_severity": {
@@ -278,7 +284,7 @@ Two timestamped files are written after every run.
 ## Requirements
 
 - **Python 3.9+**
-- **No third-party libraries** — uses only the Python standard library (`socket`, `ssl`, `urllib`, `csv`, `json`, `concurrent.futures`)
+- **No third-party libraries** — uses only the Python standard library
 
 ---
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-swagger-exposure-check v3.1 — DEFENSIVE USE ONLY
+swagger-exposure-check — DEFENSIVE USE ONLY
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   IMPORTANT — AUTHORISED USE ONLY
@@ -9,19 +9,6 @@ swagger-exposure-check v3.1 — DEFENSIVE USE ONLY
   may violate computer crime laws in your jurisdiction.
   The authors accept NO liability for misuse.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Checks Swagger/OpenAPI documentation endpoints on approved hosts.
-
-Features:
-  - Conservative defaults (3 workers) — designed for authorised audits, not spray scanning
-  - Wildcard entries (*.example.com) require --enumerate-subdomains to activate
-  - Subdomain OSINT via Certificate Transparency logs (crt.sh) + wordlist expansion
-  - DNS validation filters candidates to only live hosts before probing
-  - Custom HTTP headers (useful for WAF bypasses or authenticated scanning)
-  - Partial body read (4 KB) for accurate content detection
-  - Coloured live console table + CSV, JSON, and raw URL text outputs
-  - Automatic retries on transient network errors
-  - Interactive consent gate — you must confirm scope before scanning begins
 """
 
 from __future__ import annotations
@@ -40,6 +27,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 from urllib import error, request
+
+__version__ = "3.2.0"
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -106,6 +95,9 @@ WAF_INDICATORS: tuple[str, ...] = (
 WAYBACK_TOKENS: tuple[str, ...] = (
     "swagger", "openapi", "api-docs", "redoc", "docs", ".json", ".yaml", ".yml",
 )
+
+JS_SRC_REGEX = re.compile(r'src=["\']([^"\']+\.js[^"\']*)["\']', re.IGNORECASE)
+API_PATH_REGEX = re.compile(r'["\'](/[a-zA-Z0-9._\-/{}]+(?:swagger|openapi|api-docs|redoc)[a-zA-Z0-9._\-/{}]*)["\']', re.IGNORECASE)
 
 MAX_BODY_READ = 4096
 DEFAULT_WORKERS = 3        # Conservative default — raise with --workers for authorised bulk audits
@@ -203,6 +195,9 @@ def parse_args() -> argparse.Namespace:
                         help="Optional: extract just the URLs of HIGH/MEDIUM findings to a text file.")
     parser.add_argument("--use-wayback", action="store_true",
                         help="Query Wayback Machine (CDX) for historical URLs (discovery).")
+    parser.add_argument("--use-js", action="store_true",
+                        help="Scrape .js bundles for hidden API paths (discovery).")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--yes", action="store_true",
                         help="Skip the interactive authorisation confirmation prompt (for CI/scripts).")
     return parser.parse_args()
@@ -254,7 +249,7 @@ def expand_wildcard(
     try:
         print(colour("     Querying Certificate Transparency logs (crt.sh) ...", "dim"))
         req = request.Request(f"https://crt.sh/?q=%.{domain}&output=json", method="GET")
-        req.add_header("User-Agent", "swagger-exposure-check/3.1")
+        req.add_header("User-Agent", f"swagger-exposure-check/{__version__}")
         with request.urlopen(req, timeout=timeout) as resp:
             if resp.status == 200:
                 data = json.loads(resp.read().decode('utf-8'))
@@ -330,7 +325,7 @@ def fetch_wayback_urls(host: str, timeout: float) -> set[str]:
     
     try:
         req = request.Request(cdx_url, method="GET")
-        req.add_header("User-Agent", "swagger-exposure-check/3.1")
+        req.add_header("User-Agent", f"swagger-exposure-check/{__version__}")
         with request.urlopen(req, timeout=timeout) as resp:
             if resp.status == 200:
                 data = json.loads(resp.read().decode('utf-8'))
@@ -370,6 +365,58 @@ def fetch_wayback_urls(host: str, timeout: float) -> set[str]:
     return found_paths
 
 
+def scrape_js_urls(
+    opener: request.OpenerDirector,
+    host: str,
+    base_url: str,
+    html_content: str,
+    timeout: float,
+) -> set[str]:
+    """
+    Find <script src="..."> tags in HTML, fetch the JS, and scrape for API paths.
+    """
+    discovered_paths: set[str] = set()
+    script_srcs = JS_SRC_REGEX.findall(html_content)
+    if not script_srcs:
+        return discovered_paths
+
+    print(colour(f"     ⟳  Scraping {len(script_srcs)} JS bundles for {host} ...", "dim"))
+    
+    for src in script_srcs:
+        # Resolve relative URLs
+        if src.startswith("//"):
+            js_url = f"https:{src}"
+        elif src.startswith("/"):
+            js_url = f"{base_url.rstrip('/')}{src}"
+        elif src.startswith("http"):
+            js_url = src
+        else:
+            js_url = f"{base_url.rstrip('/')}/{src}"
+
+        # Only scrape JS from the same host to be polite/safe
+        if host not in js_url:
+            continue
+
+        try:
+            req = request.Request(js_url, method="GET")
+            req.add_header("User-Agent", f"swagger-exposure-check/{__version__}")
+            with opener.open(req, timeout=timeout) as resp:
+                if resp.status == 200:
+                    js_content = resp.read(MAX_BODY_READ * 10).decode("utf-8", errors="replace")
+                    # Find potential API paths
+                    matches = API_PATH_REGEX.findall(js_content)
+                    for m in matches:
+                        clean_m = m.split("?")[0].split("#")[0]
+                        if clean_m and clean_m != "/":
+                            discovered_paths.add(clean_m)
+        except Exception:
+            continue
+            
+    if discovered_paths:
+        print(colour(f"        ✓ Discovered {len(discovered_paths)} paths from JS scraping", "dim"))
+    return discovered_paths
+
+
 # ---------------------------------------------------------------------------
 # HTTP plumbing
 # ---------------------------------------------------------------------------
@@ -383,7 +430,7 @@ def build_opener(insecure: bool, custom_headers: list[str] = None) -> request.Op
         handlers.append(request.HTTPSHandler(context=ctx))
     opener = request.build_opener(*handlers)
     headers = [
-        ("User-Agent", "swagger-exposure-check/3.1"),
+        ("User-Agent", f"swagger-exposure-check/{__version__}"),
         ("Accept", "application/json,text/html,application/yaml,text/plain,*/*"),
     ]
     if custom_headers:
@@ -640,7 +687,7 @@ def write_reports(findings: list[Finding], output_dir: Path, output_urls_file: s
     json_path = output_dir / f"swagger_exposure_report_{stamp}.json"
 
     fieldnames = [
-        "host", "path", "url", "status", "content_type",
+        "tool_version", "host", "path", "url", "status", "content_type",
         "final_url", "body_confirmed", "severity", "note", "error",
         "missing_headers", "waf_detected"
     ]
@@ -649,11 +696,13 @@ def write_reports(findings: list[Finding], output_dir: Path, output_urls_file: s
         writer.writeheader()
         for f in findings:
             row = asdict(f)
+            row["tool_version"] = __version__
             row["missing_headers"] = ", ".join(row["missing_headers"])
             writer.writerow(row)
 
     summary = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "tool_version": __version__,
         "total_hosts_probed": len({f.host for f in findings}),
         "total_findings": len(findings),
         "counts_by_severity": {
@@ -755,23 +804,40 @@ def main() -> int:
     total_discovered = 0
     if args.use_wayback:
         print(colour("\n  ⟳  Phase 1: Historical Discovery (Wayback Machine)", "bold"))
-        # Use a longer timeout for OSINT discovery as CDX can be slow
         osint_timeout = max(30.0, args.timeout)
         for host in hosts:
             discovered = fetch_wayback_urls(host, osint_timeout)
             if discovered:
-                custom_host_paths[host] = discovered
+                custom_host_paths.setdefault(host, set()).update(discovered)
                 total_discovered += len(discovered)
         print(colour(f"     Discovery complete: {total_discovered} historical paths found.\n", "dim"))
 
+    if args.use_js:
+        print(colour("  ⟳  Phase 2: Automated JS Scraping", "bold"))
+        for host in hosts:
+            base_url = f"{scheme}://{host}"
+            try:
+                req = request.Request(base_url, method="GET")
+                req.add_header("User-Agent", f"swagger-exposure-check/{__version__}")
+                with opener.open(req, timeout=args.timeout) as resp:
+                    if "text/html" in resp.headers.get("Content-Type", "").lower():
+                        html = resp.read(MAX_BODY_READ * 2).decode("utf-8", errors="replace")
+                        js_paths = scrape_js_urls(opener, host, base_url, html, args.timeout)
+                        if js_paths:
+                            custom_host_paths.setdefault(host, set()).update(js_paths)
+                            total_discovered += len(js_paths)
+            except Exception as exc:
+                print(colour(f"        ⚠ Root fetch failed for {host} ({exc})", "error"))
+        print(colour(f"     JS scraping complete.\n", "dim"))
+
     total_checks = (len(hosts) * len(paths)) + total_discovered
-    print(colour("\n  swagger-exposure-check v3.1", "bold"))
+    print(colour(f"\n  swagger-exposure-check v{__version__}", "bold"))
     print(
         f"  Hosts: {len(hosts)}  |  Paths: {len(paths)}  |  "
         f"Total checks: {total_checks}  |  Workers: {args.workers}"
     )
     if total_discovered > 0:
-        print(colour(f"  + {total_discovered} discovered historical paths will be probed.", "dim"))
+        print(colour(f"  + {total_discovered} unique discovered paths will be probed.", "dim"))
     
     if wildcards and args.enumerate_subdomains:
         dns_label = "with DNS filter" if dns_check else "no DNS filter"
